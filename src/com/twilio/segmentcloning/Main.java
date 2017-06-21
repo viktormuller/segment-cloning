@@ -1,14 +1,15 @@
 package com.twilio.segmentcloning;
 
+import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutionException;
 
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
 
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
 import com.twilio.Twilio;
 import com.twilio.base.Page;
 import com.twilio.http.HttpClient;
@@ -16,18 +17,19 @@ import com.twilio.http.TwilioRestClient;
 import com.twilio.rest.notify.v1.Service;
 import com.twilio.rest.notify.v1.service.User;
 import com.twilio.rest.notify.v1.service.UserReader;
+import com.twilio.rest.notify.v1.service.user.SegmentMembership;
 
 public class Main {
 	
-	 public static final String ACCOUNT_SID = "ACddd55023e95e245f47506b888118f8f8";
-	    public static final String AUTH_TOKEN = "b0774424b22af6e413c7c812daa771f5";
+	 public static final String ACCOUNT_SID = "";
+	    public static final String AUTH_TOKEN = "";
 	    
 	    public static final int SEGMENT_SIZE = 500;
 	    
 	    public static final String ORIGINAL_SEGMENT = "original segment";
 	    public static final String CLONED_SEGMENT = "cloned segment";
 	    
-	    public static final int THREAD_POOL_SIZE =10;
+	    public static final int CONNECTION_POOL_SIZE =10;
 	    
 	    private static final int CONNECTION_TIMEOUT = 10000;
 	    private static final int SOCKET_TIMEOUT = 30500;
@@ -40,67 +42,82 @@ public class Main {
 	        Service service = Service.creator().setFriendlyName("DeleteMe").create();	
 	        System.out.println("SERVICE SID: " + service.getSid());
 	        
-	        ExecutorService executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
 
 	        //Create SEGMENT_SIZE number of new Users in ORIGINAL_SEGMENT
-	        createSegment(service, executor); 
+	        createSegment(service); 
 	        
-	        executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
-	        
+	     	        
 	        //Clone Users in ORIGINAL_SEGMENT to CLONED_SEGMENT
-	        cloneSegment(service, executor); 
+	        cloneSegment(service); 
 	        
 	        Service.deleter(service.getSid()).delete();
 	    }
 
-		public static void createSegment(Service service, ExecutorService executor) {
+		public static void createSegment(Service service) {
 			long starttime = System.currentTimeMillis();
+			
+			List<ListenableFuture<User>> futureList = new LinkedList<ListenableFuture<User>>();
 	        for (int i = 0; i < SEGMENT_SIZE; i++) {
-	        	Runnable worker = new CreateUserTask(service.getSid(), "User" + i, ORIGINAL_SEGMENT );
-	        	executor.execute(worker);	        	
+	        	String identity = "User"+i;
+	        	String segment = ORIGINAL_SEGMENT;
+  
+	              try {	          		
+	          		futureList.add(User.creator(service.getSid(), identity).setSegment(segment).createAsync());	          		
+	              } catch (Exception e) {
+	      			e.printStackTrace();
+	      		}
 			}
 	        
-	        executor.shutdown();
+	        ListenableFuture<List<User>>listFuture = Futures.allAsList(futureList);
 	        
 	        try {
-				executor.awaitTermination(10, TimeUnit.SECONDS);
-				long endtime = System.currentTimeMillis();
-		        System.out.println("Finished all threads"); 	        
-		        System.out.println("Total execution time: " + (endtime-starttime));
-		        System.out.println("Average rate: " + SEGMENT_SIZE*1000/(endtime-starttime));
-			} catch (InterruptedException e) {
+	        	//Test with large User set, not sure how this uses memory when 500K users are returned.
+	        	//Although you would not need this step in production anyway
+				listFuture.get();
+			    long endtime = System.currentTimeMillis();
+				System.out.println("Finished all threads"); 	        
+				System.out.println("Total execution time: " + (endtime-starttime));
+				System.out.println("Average rate: " + SEGMENT_SIZE*1000/(endtime-starttime));
+			} catch (InterruptedException | ExecutionException e) {
 				e.printStackTrace();
 			}
 		}
 
-		public static void cloneSegment(Service service, ExecutorService executor) {
-			long starttime;
-			starttime = System.currentTimeMillis();
+		public static void cloneSegment(Service service) {
+			long startTime = System.currentTimeMillis();
 
 			UserReader reader = User.reader(service.getSid());
 			
+			int i = 0;
 			for (Page<User> page = reader.firstPage();page.hasNextPage(); page =reader.nextPage(page)){
-				
+				long pageStartTime = System.currentTimeMillis();
 				List<User> userList = page.getRecords();
-
+				
+				List<ListenableFuture<SegmentMembership>> futureList = new LinkedList<ListenableFuture<SegmentMembership>>();
+				
 				for (User user : userList) {
-					Runnable worker = new AddToSegmentTask(service.getSid(), user.getIdentity(), CLONED_SEGMENT );
-					executor.execute(worker);
+		        	String segment = CLONED_SEGMENT;
+					futureList.add(SegmentMembership.creator(service.getSid(), user.getIdentity(), segment).createAsync());
 				}
-						
+				
+				ListenableFuture<List<SegmentMembership>>listFuture = Futures.allAsList(futureList);
+				try {
+					//This should be OK, given that default page size is 50
+					listFuture.get();
+					long pageEndTime = System.currentTimeMillis();
+			        System.out.println("Finished page " + i); 	        
+			        System.out.println("Total execution time: " + (pageEndTime-pageStartTime));
+			        System.out.println("Average rate: " + page.getPageSize()*1000/(pageEndTime-pageStartTime));
+				} catch (InterruptedException | ExecutionException e) {
+					e.printStackTrace();
+				}
+				i++;
 			}
-
-	        executor.shutdown();
-	        
-	        try {
-				executor.awaitTermination(10, TimeUnit.SECONDS);
-				long endtime = System.currentTimeMillis();
-		        System.out.println("Finished all threads"); 	        
-		        System.out.println("Total execution time: " + (endtime-starttime));
-		        System.out.println("Average rate: " + SEGMENT_SIZE*1000/(endtime-starttime));
-			} catch (InterruptedException e) {
-				e.printStackTrace();
-			}
+			long endTime = System.currentTimeMillis();
+			System.out.println("Finished all pages"); 	        
+	        System.out.println("Total execution time: " + (endTime-startTime));
+	        System.out.println("Effective rate (including reads): " + SEGMENT_SIZE*1000/(endTime-startTime));
+			
 		}
 
 		public static void initTwilio() {
@@ -110,8 +127,8 @@ public class Main {
 	                .build();
 	    	
 	    	PoolingHttpClientConnectionManager conManager = new PoolingHttpClientConnectionManager();
-	    	conManager.setDefaultMaxPerRoute(THREAD_POOL_SIZE);
-	    	conManager.setMaxTotal(THREAD_POOL_SIZE*2);
+	    	conManager.setDefaultMaxPerRoute(CONNECTION_POOL_SIZE);
+	    	conManager.setMaxTotal(CONNECTION_POOL_SIZE*2);
 	    	
 	    	HttpClient httpClient = new ThrottledNetworkHttpClient(HttpClientBuilder.create()
             .useSystemProperties()
